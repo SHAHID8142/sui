@@ -976,20 +976,18 @@ impl<S: ObjectStore> TemporaryStore<S> {
             }
         }
 
-        self.collect_storage_and_rebate(gas_status, gas_object_id);
+        self.ensure_gas_and_input_mutated(gas_object_id);
+        self.collect_storage_and_rebate(gas_status);
         if let Some(gas_object_id) = gas_object_id {
             if let Err(err) = gas_status.charge_storage_and_rebate() {
-                // println!("GAS - Out Of Gas charging storage");
-                // out of gas
                 self.reset(gas, gas_status);
-                self.cleanup_store_on_out_of_gas(gas_status, gas_object_id);
+                gas_status.adjust_computation_on_out_of_gas();
+                self.ensure_gas_and_input_mutated(Some(gas_object_id));
+                self.collect_rebate(gas_status);
                 if execution_result.is_ok() {
                     *execution_result = Err(err);
                 }
             }
-
-            // Important to fetch the gas object here instead of earlier, as it may have been reset
-            // previously in the case of error.
             let cost_summary = gas_status.summary();
             let gas_used = cost_summary.net_gas_usage();
 
@@ -1028,46 +1026,7 @@ impl<S: ObjectStore> TemporaryStore<S> {
         }
     }
 
-    fn cleanup_store_on_out_of_gas(
-        &mut self,
-        gas_status: &mut SuiGasStatus<'_>,
-        gas_object_id: ObjectID,
-    ) {
-        // If the gas coin was not yet written, charge gas for mutating the gas object in advance.
-        let gas_object = self
-            .read_object(&gas_object_id)
-            .expect("We constructed the object map so it should always have the gas object id")
-            .clone();
-        self.written
-            .entry(gas_object_id)
-            .or_insert_with(|| (gas_object, WriteKind::Mutate));
-        self.ensure_active_inputs_mutated();
-
-        let mut objects_to_update = vec![];
-        for (object, write_kind) in self.written.values() {
-            if !object.is_immutable() {
-                objects_to_update.push((object.clone(), *write_kind));
-            }
-        }
-        for (object, write_kind) in objects_to_update {
-            self.write_object(object, write_kind);
-        }
-        // we do not charge for storage at this point because we are out of gas
-        gas_status.adjust_computation_on_out_of_gas();
-    }
-
-    /// Track storage gas for each mutable input object (including the gas coin)
-    /// and each created object. Compute storage refunds for each deleted object.
-    /// Will *not* charge anything, gas status keeps track of storage cost and rebate.
-    /// All objects will be updated with their new (current) storage rebate/cost.
-    /// `SuiGasStatus` `storage_rebate` and `storage_gas_units` track the transaction
-    /// overall storage rebate and cost.
-    fn collect_storage_and_rebate(
-        &mut self,
-        gas_status: &mut SuiGasStatus<'_>,
-        gas_object_id: Option<ObjectID>,
-    ) {
-        // If the gas coin was not yet written, charge gas for mutating the gas object in advance.
+    fn ensure_gas_and_input_mutated(&mut self, gas_object_id: Option<ObjectID>) {
         if let Some(gas_object_id) = gas_object_id {
             let gas_object = self
                 .read_object(&gas_object_id)
@@ -1078,7 +1037,15 @@ impl<S: ObjectStore> TemporaryStore<S> {
                 .or_insert_with(|| (gas_object, WriteKind::Mutate));
         }
         self.ensure_active_inputs_mutated();
+    }
 
+    /// Track storage gas for each mutable input object (including the gas coin)
+    /// and each created object. Compute storage refunds for each deleted object.
+    /// Will *not* charge anything, gas status keeps track of storage cost and rebate.
+    /// All objects will be updated with their new (current) storage rebate/cost.
+    /// `SuiGasStatus` `storage_rebate` and `storage_gas_units` track the transaction
+    /// overall storage rebate and cost.
+    fn collect_storage_and_rebate(&mut self, gas_status: &mut SuiGasStatus<'_>) {
         let mut objects_to_update = vec![];
         for (object_id, (object, write_kind)) in &mut self.written {
             // get the object storage_rebate in input for mutated objects
@@ -1117,6 +1084,16 @@ impl<S: ObjectStore> TemporaryStore<S> {
             }
         }
 
+        self.collect_rebate(gas_status);
+
+        // Write all objects at the end only if all previous gas charges succeeded.
+        // This avoids polluting the temporary store state if this function failed.
+        for (object, write_kind) in objects_to_update {
+            self.write_object(object, write_kind);
+        }
+    }
+
+    fn collect_rebate(&self, gas_status: &mut SuiGasStatus<'_>) {
         for (object_id, (version, kind)) in &self.deleted {
             match kind {
                 DeleteKind::Wrap | DeleteKind::Normal => {
@@ -1128,12 +1105,6 @@ impl<S: ObjectStore> TemporaryStore<S> {
                     // an unwrapped object does not have a storage rebate, we will charge for storage changes via its wrapper object
                 }
             }
-        }
-
-        // Write all objects at the end only if all previous gas charges succeeded.
-        // This avoids polluting the temporary store state if this function failed.
-        for (object, write_kind) in objects_to_update {
-            self.write_object(object, write_kind);
         }
     }
 }
